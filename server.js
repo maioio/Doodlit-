@@ -1,573 +1,577 @@
 'use strict';
 
-const express = require('express');
-const http = require('http');
 const path = require('path');
 const fs = require('fs');
+const http = require('http');
+const express = require('express');
 const { Server } = require('socket.io');
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: '*', methods: ['GET', 'POST'] }
-});
+const io = new Server(server, { cors: { origin: true, methods: ['GET', 'POST'] } });
 
-// Static files
+const PORT = process.env.PORT || 3000;
+
+// Static
 app.use(express.static(path.join(__dirname, 'public')));
 
-// -----------------------
-// Config
-// -----------------------
-const MAX_PLAYERS = 10;
+// ---- Config ----
+const MAX_PLAYERS_PER_ROOM = 10;
+const CHOOSE_WORD_SECONDS = 15;
+const ROUND_SECONDS = 60;
+const WORD_OPTIONS = 3;
 
-const CHOOSE_WORD_SECONDS_DEFAULT = 15;
-const DRAW_SECONDS_DEFAULT = 60;
+// Extra time feature
+const EXTRA_SECONDS_PER_PURCHASE = 10;
+const EXTRA_TIME_COST_POINTS = 30; // add +10s costs 30 points
+const MAX_EXTRA_PURCHASES_PER_ROUND = 3;
 
-const WORD_OPTIONS_COUNT = 3;
+// Scoring
+const BASE_GUESS_POINTS = 100;
+const DRAWER_POINTS_PER_GUESS = 30;
 
-// Time extension: trade points for extra seconds
-const EXTEND_SECONDS = 15;
-const EXTEND_COST_POINTS = 80;
-
-// Rounds: how many drawings per game
-const TOTAL_TURNS_DEFAULT = 10; // למשל: 10 תורות סך הכל (אפשר לשנות)
-
-// -----------------------
-// Words (Hebrew) loader
-// -----------------------
+// ---- Words loading ----
 function loadWordsHebrew() {
+  const p = path.join(__dirname, 'public', 'words-he.json');
   try {
-    const p = path.join(__dirname, 'public', 'words-he.json');
     const raw = fs.readFileSync(p, 'utf8');
     const arr = JSON.parse(raw);
-    if (!Array.isArray(arr)) throw new Error('words-he.json must be an array');
-    const cleaned = arr
-      .map(x => (typeof x === 'string' ? x.trim() : ''))
-      .filter(Boolean);
-
-    if (cleaned.length < 50) {
-      console.log(`[words] loaded ${cleaned.length}, warning: low count`);
-    } else {
-      console.log(`[words] loaded ${cleaned.length}`);
-    }
-    return cleaned;
+    if (!Array.isArray(arr)) return [];
+    return arr
+      .map(w => String(w || '').trim())
+      .filter(w => w.length >= 2 && w.length <= 32);
   } catch (e) {
-    console.log('[words] failed to load public/words-he.json:', e.message);
-    return ['חתול', 'כלב', 'בית', 'עץ', 'כדור', 'טלפון', 'מחשב', 'ים', 'אופניים'];
+    return [];
   }
 }
-
-let WORDS_HE = loadWordsHebrew();
-
-// Optional endpoint to verify words loaded
-app.get('/health', (req, res) => {
-  res.json({
-    ok: true,
-    wordsCount: WORDS_HE.length,
-    players: Object.keys(state.players).length,
-    phase: state.phase
-  });
-});
-
-// -----------------------
-// Game State (single room)
-// -----------------------
-const state = {
-  phase: 'lobby', // lobby | choosing | drawing | reveal
-  players: {}, // socketId -> {id, name, score, isConnected, lastActive}
-  order: [], // socketIds in turn order
-  turnIndex: -1, // index in order for current drawer
-  turnNumber: 0, // how many turns completed
-  totalTurns: TOTAL_TURNS_DEFAULT,
-
-  drawerId: null,
-  word: null,
-  maskedWord: null,
-  wordOptions: [],
-
-  chooseSeconds: CHOOSE_WORD_SECONDS_DEFAULT,
-  drawSeconds: DRAW_SECONDS_DEFAULT,
-
-  chooseEndsAt: null,
-  drawEndsAt: null,
-
-  timer: null, // setInterval handle
-  guessedThisTurn: new Set(), // socketIds
-  chatLocked: false
-};
-
-function nowMs() { return Date.now(); }
-
-function clampName(name) {
-  const s = String(name || '').trim();
-  if (!s) return 'שחקן';
-  return s.slice(0, 18);
+let WORDS = loadWordsHebrew();
+if (WORDS.length < 50) {
+  WORDS = ['חתול', 'כלב', 'בית', 'עץ', 'ים', 'שמש', 'מחשב', 'טלפון', 'אופניים', 'כדור', 'ספר', 'פרח'];
 }
 
-function shuffle(arr) {
-  const a = arr.slice();
-  for (let i = a.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [a[i], a[j]] = [a[j], a[i]];
-  }
-  return a;
-}
-
-function pickNWords(n) {
+function pickRandomWords(n) {
   const out = [];
   const used = new Set();
-  const max = Math.min(n, WORDS_HE.length);
-
-  while (out.length < max) {
-    const w = WORDS_HE[Math.floor(Math.random() * WORDS_HE.length)];
-    if (!w) continue;
-    const key = w.toLowerCase();
-    if (used.has(key)) continue;
-    used.add(key);
-    out.push(w);
+  while (out.length < n && used.size < WORDS.length) {
+    const idx = Math.floor(Math.random() * WORDS.length);
+    if (used.has(idx)) continue;
+    used.add(idx);
+    out.push(WORDS[idx]);
   }
-
-  // Fallback if word list tiny
-  while (out.length < n) {
-    out.push('חתול');
-  }
+  while (out.length < n) out.push(WORDS[Math.floor(Math.random() * WORDS.length)]);
   return out;
 }
 
-function maskWord(word) {
-  // Mask only letters, keep spaces/dashes
-  return String(word).split('').map(ch => {
-    if (ch === ' ' || ch === '-' || ch === '_' || ch === '/') return ch;
-    return '•';
-  }).join('');
+function normalizeGuess(s) {
+  return String(s || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, '') // keep letters/numbers/spaces
+    .replace(/\s+/g, ' ');
 }
 
-function publicState() {
-  const playersArr = Object.values(state.players)
-    .filter(p => p.isConnected)
-    .map(p => ({
-      id: p.id,
-      name: p.name,
-      score: p.score
-    }))
-    .sort((a, b) => b.score - a.score);
+function roomIdFromInput(input) {
+  const safe = String(input || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]/g, '');
+  if (!safe) return null;
+  return safe.slice(0, 32);
+}
+
+// ---- Room state ----
+const rooms = new Map();
+/*
+room = {
+  id,
+  createdAt,
+  players: Map(socketId -> player),
+  hostId,
+  phase: 'lobby'|'choose'|'draw'|'reveal',
+  drawerId,
+  round: number,
+  word: string|null,
+  wordMasked: string,
+  wordOptions: string[],
+  guessed: Set(socketId),
+  timers: { choose: Timeout|null, tick: Timeout|null },
+  timeLeft: number,
+  extraPurchases: number
+}
+player = { id, name, score, connectedAt, isHost }
+*/
+
+function getOrCreateRoom(roomId) {
+  if (!rooms.has(roomId)) {
+    rooms.set(roomId, {
+      id: roomId,
+      createdAt: Date.now(),
+      players: new Map(),
+      hostId: null,
+      phase: 'lobby',
+      drawerId: null,
+      round: 0,
+      word: null,
+      wordMasked: '',
+      wordOptions: [],
+      guessed: new Set(),
+      timers: { choose: null, tick: null },
+      timeLeft: 0,
+      extraPurchases: 0
+    });
+  }
+  return rooms.get(roomId);
+}
+
+function getPublicRoomState(room) {
+  const players = Array.from(room.players.values()).map(p => ({
+    id: p.id,
+    name: p.name,
+    score: p.score,
+    isHost: p.id === room.hostId,
+    isDrawer: p.id === room.drawerId
+  }));
+  players.sort((a, b) => b.score - a.score);
 
   return {
-    phase: state.phase,
-    players: playersArr,
-    maxPlayers: MAX_PLAYERS,
-
-    turnNumber: state.turnNumber,
-    totalTurns: state.totalTurns,
-
-    drawerId: state.drawerId,
-    maskedWord: state.maskedWord,
-
-    chooseSeconds: state.chooseSeconds,
-    drawSeconds: state.drawSeconds,
-
-    chooseEndsAt: state.chooseEndsAt,
-    drawEndsAt: state.drawEndsAt
+    id: room.id,
+    phase: room.phase,
+    round: room.round,
+    hostId: room.hostId,
+    drawerId: room.drawerId,
+    players,
+    timeLeft: room.timeLeft,
+    chooseWordSeconds: CHOOSE_WORD_SECONDS,
+    roundSeconds: ROUND_SECONDS,
+    extra: {
+      costPoints: EXTRA_TIME_COST_POINTS,
+      addSeconds: EXTRA_SECONDS_PER_PURCHASE,
+      maxPerRound: MAX_EXTRA_PURCHASES_PER_ROUND,
+      usedThisRound: room.extraPurchases
+    }
   };
 }
 
-function broadcastState() {
-  io.emit('state:update', publicState());
+function emitRoom(room) {
+  io.to(room.id).emit('room:state', getPublicRoomState(room));
 }
 
-function stopTimer() {
-  if (state.timer) {
-    clearInterval(state.timer);
-    state.timer = null;
-  }
+function systemMessage(room, text) {
+  io.to(room.id).emit('chat:msg', {
+    type: 'system',
+    name: 'מערכת',
+    text,
+    ts: Date.now()
+  });
 }
 
-function startTicking() {
-  stopTimer();
-  state.timer = setInterval(() => {
-    if (state.phase === 'choosing' && state.chooseEndsAt) {
-      const left = Math.max(0, state.chooseEndsAt - nowMs());
-      io.emit('timer:choose', { msLeft: left });
-      if (left <= 0) {
-        // Auto-pick first word if not chosen
-        if (state.wordOptions.length > 0) {
-          setChosenWord(state.wordOptions[0]);
-        } else {
-          setChosenWord(pickNWords(1)[0]);
-        }
-      }
-    }
-
-    if (state.phase === 'drawing' && state.drawEndsAt) {
-      const left = Math.max(0, state.drawEndsAt - nowMs());
-      io.emit('timer:draw', { msLeft: left });
-      if (left <= 0) {
-        endTurn('time');
-      }
-    }
-  }, 250);
+function maskWord(word) {
+  // keep spaces, mask letters
+  return word.split('').map(ch => (ch === ' ' ? ' ' : '_')).join('');
 }
 
-function ensureOrder() {
-  // Keep only connected players
-  const connectedIds = Object.values(state.players)
-    .filter(p => p.isConnected)
-    .map(p => p.id);
-
-  // If order empty or missing players, rebuild
-  const existing = state.order.filter(id => connectedIds.includes(id));
-  const missing = connectedIds.filter(id => !existing.includes(id));
-  state.order = existing.concat(missing);
-
-  // Clamp order length
-  state.order = state.order.slice(0, MAX_PLAYERS);
+function clearTimers(room) {
+  if (room.timers.choose) clearTimeout(room.timers.choose);
+  if (room.timers.tick) clearInterval(room.timers.tick);
+  room.timers.choose = null;
+  room.timers.tick = null;
 }
 
-function getDrawerId() {
-  ensureOrder();
-  if (state.order.length === 0) return null;
-  state.turnIndex = (state.turnIndex + 1) % state.order.length;
-  return state.order[state.turnIndex];
+function nextDrawer(room) {
+  const ids = Array.from(room.players.keys());
+  if (ids.length === 0) return null;
+
+  // rotate drawer
+  if (!room.drawerId) return ids[0];
+  const idx = ids.indexOf(room.drawerId);
+  return ids[(idx + 1) % ids.length];
 }
 
-function resetForNewTurn() {
-  state.word = null;
-  state.maskedWord = null;
-  state.wordOptions = [];
-  state.guessedThisTurn = new Set();
-  state.chooseEndsAt = null;
-  state.drawEndsAt = null;
-  state.chatLocked = false;
-}
+function startChoosePhase(room) {
+  clearTimers(room);
 
-function startGame() {
-  ensureOrder();
-  if (state.order.length < 2) {
-    io.emit('toast', { type: 'error', text: 'צריך לפחות 2 שחקנים כדי להתחיל' });
+  if (room.players.size < 2) {
+    room.phase = 'lobby';
+    room.drawerId = null;
+    room.word = null;
+    room.wordOptions = [];
+    room.wordMasked = '';
+    room.timeLeft = 0;
+    room.extraPurchases = 0;
+    systemMessage(room, 'צריך לפחות 2 שחקנים כדי להתחיל.');
+    emitRoom(room);
     return;
   }
 
-  state.phase = 'choosing';
-  state.turnNumber = 0;
-  state.totalTurns = TOTAL_TURNS_DEFAULT; // אפשר להפוך להגדרה מהלקוח
-  state.turnIndex = -1;
-  resetForNewTurn();
+  room.phase = 'choose';
+  room.round += 1;
+  room.guessed = new Set();
+  room.drawerId = nextDrawer(room);
+  room.word = null;
+  room.wordMasked = '';
+  room.wordOptions = pickRandomWords(WORD_OPTIONS);
+  room.timeLeft = CHOOSE_WORD_SECONDS;
+  room.extraPurchases = 0;
 
-  state.drawerId = getDrawerId();
-  state.wordOptions = pickNWords(WORD_OPTIONS_COUNT);
+  systemMessage(room, `סבב ${room.round}: ${getPlayerName(room, room.drawerId)} מצייר/ת. בוחר/ת מילה.`);
+  emitRoom(room);
 
-  // notify drawer to choose
-  io.to(state.drawerId).emit('word:options', {
-    options: state.wordOptions,
-    seconds: state.chooseSeconds
+  // Send options only to drawer
+  io.to(room.drawerId).emit('word:options', {
+    options: room.wordOptions,
+    seconds: CHOOSE_WORD_SECONDS
   });
 
-  // lock word for others (only masked)
-  state.maskedWord = null;
-
-  state.chooseEndsAt = nowMs() + state.chooseSeconds * 1000;
-
-  io.emit('round:start', {
-    drawerId: state.drawerId,
-    phase: 'choosing'
-  });
-
-  broadcastState();
-  startTicking();
+  room.timers.choose = setTimeout(() => {
+    // auto-pick if not chosen
+    const w = room.wordOptions[Math.floor(Math.random() * room.wordOptions.length)];
+    startDrawPhase(room, w);
+  }, CHOOSE_WORD_SECONDS * 1000);
 }
 
-function setChosenWord(word) {
-  if (state.phase !== 'choosing') return;
+function startDrawPhase(room, chosenWord) {
+  clearTimers(room);
 
-  const w = String(word || '').trim();
-  state.word = w || pickNWords(1)[0];
-  state.maskedWord = maskWord(state.word);
+  const w = String(chosenWord || '').trim();
+  room.word = w || room.wordOptions[0] || pickRandomWords(1)[0];
+  room.wordMasked = maskWord(room.word);
+  room.phase = 'draw';
+  room.timeLeft = ROUND_SECONDS;
+  room.extraPurchases = 0;
+  room.guessed = new Set();
 
-  state.phase = 'drawing';
-  state.chooseEndsAt = null;
+  // Tell drawer the word, others masked
+  io.to(room.drawerId).emit('word:set', { word: room.word, masked: room.wordMasked, isDrawer: true });
+  io.to(room.id).except(room.drawerId).emit('word:set', { word: null, masked: room.wordMasked, isDrawer: false });
 
-  // Send real word only to drawer
-  io.to(state.drawerId).emit('word:set', { word: state.word });
+  // Clear canvas for everyone
+  io.to(room.id).emit('draw:clear');
 
-  // Send masked to everyone (including drawer, no harm)
-  io.emit('word:masked', { masked: state.maskedWord });
+  systemMessage(room, 'הסבב התחיל. תנסו לנחש בצ׳אט.');
+  emitRoom(room);
 
-  // Clear canvas for all
-  io.emit('canvas:clear');
-
-  // Start drawing timer
-  state.drawEndsAt = nowMs() + state.drawSeconds * 1000;
-
-  io.emit('round:start', {
-    drawerId: state.drawerId,
-    phase: 'drawing',
-    drawSeconds: state.drawSeconds
-  });
-
-  broadcastState();
-  startTicking();
+  room.timers.tick = setInterval(() => {
+    room.timeLeft -= 1;
+    if (room.timeLeft <= 0) {
+      endRound(room);
+      return;
+    }
+    // If everyone guessed (except drawer)
+    const guessersNeeded = Math.max(0, room.players.size - 1);
+    if (room.guessed.size >= guessersNeeded) {
+      endRound(room);
+      return;
+    }
+    emitRoom(room);
+  }, 1000);
 }
 
-function scoreGuess(socketId, msLeft) {
-  // Simple scoring: more time left = more points
-  // Max 200, min 20
-  const secLeft = Math.max(0, Math.floor(msLeft / 1000));
-  const base = 20;
-  const bonus = Math.min(180, secLeft * 3);
-  return base + bonus;
-}
+function endRound(room) {
+  clearTimers(room);
+  room.phase = 'reveal';
+  systemMessage(room, `הזמן נגמר. המילה הייתה: ${room.word}`);
+  io.to(room.id).emit('word:reveal', { word: room.word });
 
-function endTurn(reason) {
-  if (state.phase !== 'drawing') return;
+  emitRoom(room);
 
-  state.phase = 'reveal';
-  stopTimer();
-
-  // Reveal real word to all
-  io.emit('round:reveal', {
-    word: state.word,
-    reason
-  });
-
-  broadcastState();
-
-  // After short delay, next turn or end game
+  // short reveal then next
   setTimeout(() => {
-    state.turnNumber += 1;
-
-    const connectedCount = Object.values(state.players).filter(p => p.isConnected).length;
-    if (connectedCount < 2) {
-      state.phase = 'lobby';
-      resetForNewTurn();
-      state.drawerId = null;
-      io.emit('toast', { type: 'info', text: 'חזרנו ללובי (אין מספיק שחקנים)' });
-      broadcastState();
-      return;
-    }
-
-    if (state.turnNumber >= state.totalTurns) {
-      state.phase = 'lobby';
-      resetForNewTurn();
-      state.drawerId = null;
-      io.emit('game:over', { leaderboard: publicState().players });
-      broadcastState();
-      return;
-    }
-
-    // Next turn
-    state.phase = 'choosing';
-    resetForNewTurn();
-
-    state.drawerId = getDrawerId();
-    state.wordOptions = pickNWords(WORD_OPTIONS_COUNT);
-
-    io.to(state.drawerId).emit('word:options', {
-      options: state.wordOptions,
-      seconds: state.chooseSeconds
-    });
-
-    state.chooseEndsAt = nowMs() + state.chooseSeconds * 1000;
-
-    io.emit('round:start', {
-      drawerId: state.drawerId,
-      phase: 'choosing'
-    });
-
-    broadcastState();
-    startTicking();
-  }, 2500);
+    startChoosePhase(room);
+  }, 3000);
 }
 
-// -----------------------
-// Socket events
-// -----------------------
+function getPlayerName(room, socketId) {
+  const p = room.players.get(socketId);
+  return p ? p.name : 'שחקן';
+}
+
+function tryStartIfAuto(room) {
+  // auto-start if host exists and at least 2 players, and still in lobby
+  if (room.phase === 'lobby' && room.players.size >= 2) {
+    startChoosePhase(room);
+  }
+}
+
+// ---- Socket ----
 io.on('connection', (socket) => {
-  // Join
-  socket.on('player:join', (payload) => {
-    const name = clampName(payload?.name);
+  socket.on('room:join', ({ roomId, name }) => {
+    const rid = roomIdFromInput(roomId);
+    const playerName = String(name || '').trim().slice(0, 18);
 
-    // max players
-    const connectedCount = Object.values(state.players).filter(p => p.isConnected).length;
-    if (connectedCount >= MAX_PLAYERS) {
-      socket.emit('join:denied', { reason: 'החדר מלא' });
-      socket.disconnect(true);
+    if (!rid) {
+      socket.emit('error:msg', { text: 'חסר מזהה חדר.' });
+      return;
+    }
+    if (!playerName) {
+      socket.emit('error:msg', { text: 'צריך שם.' });
       return;
     }
 
-    state.players[socket.id] = {
+    const room = getOrCreateRoom(rid);
+
+    // capacity
+    if (room.players.size >= MAX_PLAYERS_PER_ROOM) {
+      socket.emit('error:msg', { text: 'החדר מלא (10 שחקנים).' });
+      return;
+    }
+
+    socket.join(rid);
+    socket.data.roomId = rid;
+
+    const player = {
       id: socket.id,
-      name,
+      name: playerName,
       score: 0,
-      isConnected: true,
-      lastActive: nowMs()
+      connectedAt: Date.now(),
+      isHost: false
     };
+    room.players.set(socket.id, player);
 
-    ensureOrder();
-
-    socket.emit('join:ok', {
-      id: socket.id,
-      state: publicState()
-    });
-
-    io.emit('chat:system', { text: `${name} הצטרף` });
-    broadcastState();
-  });
-
-  // Request full state
-  socket.on('state:get', () => {
-    socket.emit('state:update', publicState());
-  });
-
-  // Start game (anyone can for now)
-  socket.on('game:start', () => {
-    if (state.phase !== 'lobby') return;
-    startGame();
-  });
-
-  // Drawer chooses word
-  socket.on('word:choose', (payload) => {
-    if (state.phase !== 'choosing') return;
-    if (socket.id !== state.drawerId) return;
-
-    const chosen = String(payload?.word || '').trim();
-    if (!chosen) return;
-
-    // must be one of options (or allow custom if you want)
-    if (!state.wordOptions.includes(chosen)) {
-      // ignore
-      return;
+    if (!room.hostId) {
+      room.hostId = socket.id;
+      player.isHost = true;
     }
 
-    setChosenWord(chosen);
+    systemMessage(room, `${playerName} הצטרף/ה לחדר.`);
+    emitRoom(room);
+
+    // Send current word state to joining player
+    if (room.phase === 'draw') {
+      if (socket.id === room.drawerId) {
+        socket.emit('word:set', { word: room.word, masked: room.wordMasked, isDrawer: true });
+      } else {
+        socket.emit('word:set', { word: null, masked: room.wordMasked, isDrawer: false });
+      }
+    } else if (room.phase === 'reveal') {
+      socket.emit('word:reveal', { word: room.word });
+    } else {
+      socket.emit('word:set', { word: null, masked: '', isDrawer: false });
+    }
+
+    // Auto-start
+    tryStartIfAuto(room);
   });
 
-  // Drawing data relay (only drawer allowed)
-  socket.on('draw:data', (payload) => {
-    if (state.phase !== 'drawing') return;
-    if (socket.id !== state.drawerId) return;
-
-    // Broadcast to others (including drawer is ok, but usually not needed)
-    socket.broadcast.emit('draw:data', payload);
+  socket.on('room:leave', () => {
+    leaveRoom(socket);
   });
 
-  // Clear canvas (drawer)
-  socket.on('canvas:clear', () => {
-    if (state.phase !== 'drawing') return;
-    if (socket.id !== state.drawerId) return;
-    io.emit('canvas:clear');
+  socket.on('disconnect', () => {
+    leaveRoom(socket, true);
   });
 
-  // Chat / Guess
-  socket.on('chat:send', (payload) => {
-    const p = state.players[socket.id];
-    if (!p || !p.isConnected) return;
+  socket.on('word:choose', ({ word }) => {
+    const rid = socket.data.roomId;
+    if (!rid) return;
+    const room = rooms.get(rid);
+    if (!room) return;
 
-    const text = String(payload?.text || '').trim();
-    if (!text) return;
+    if (room.phase !== 'choose') return;
+    if (socket.id !== room.drawerId) return;
 
-    // Always broadcast chat message
-    io.emit('chat:msg', {
-      from: p.name,
-      id: socket.id,
-      text
-    });
+    const chosen = String(word || '').trim();
+    if (!room.wordOptions.includes(chosen)) return;
 
-    // Guess logic in drawing phase (guessers only)
-    if (state.phase === 'drawing') {
-      // Drawer cannot guess
-      if (socket.id === state.drawerId) return;
+    startDrawPhase(room, chosen);
+  });
 
-      // Already guessed
-      if (state.guessedThisTurn.has(socket.id)) return;
+  socket.on('draw:stroke', (payload) => {
+    const rid = socket.data.roomId;
+    if (!rid) return;
+    const room = rooms.get(rid);
+    if (!room) return;
+    if (room.phase !== 'draw') return;
+    if (socket.id !== room.drawerId) return;
 
-      // Correct?
-      const guess = text.toLowerCase();
-      const answer = String(state.word || '').toLowerCase();
+    // broadcast to others
+    socket.to(rid).emit('draw:stroke', payload);
+  });
 
-      if (guess === answer) {
-        const msLeft = Math.max(0, (state.drawEndsAt || nowMs()) - nowMs());
-        const points = scoreGuess(socket.id, msLeft);
+  socket.on('draw:clear', () => {
+    const rid = socket.data.roomId;
+    if (!rid) return;
+    const room = rooms.get(rid);
+    if (!room) return;
+    if (room.phase !== 'draw') return;
+    if (socket.id !== room.drawerId) return;
 
-        p.score += points;
-        state.guessedThisTurn.add(socket.id);
+    io.to(rid).emit('draw:clear');
+  });
 
-        // drawer gets small bonus per correct guess
-        const drawer = state.players[state.drawerId];
-        if (drawer) drawer.score += 15;
+  socket.on('chat:msg', ({ text }) => {
+    const rid = socket.data.roomId;
+    if (!rid) return;
+    const room = rooms.get(rid);
+    if (!room) return;
 
-        io.emit('chat:system', { text: `${p.name} ניחש נכון (+${points})` });
-        broadcastState();
+    const player = room.players.get(socket.id);
+    if (!player) return;
 
-        // If everyone guessed (all except drawer)
-        const connectedGuessers = Object.values(state.players)
-          .filter(x => x.isConnected && x.id !== state.drawerId)
-          .map(x => x.id);
+    const msg = String(text || '').trim().slice(0, 140);
+    if (!msg) return;
 
-        const allGuessed = connectedGuessers.length > 0 &&
-          connectedGuessers.every(id => state.guessedThisTurn.has(id));
+    // Check guess
+    if (room.phase === 'draw' && socket.id !== room.drawerId && room.word) {
+      const norm = normalizeGuess(msg);
+      const target = normalizeGuess(room.word);
 
-        if (allGuessed) {
-          endTurn('כולם ניחשו');
+      if (norm && target && norm === target) {
+        if (!room.guessed.has(socket.id)) {
+          room.guessed.add(socket.id);
+
+          // points based on time left
+          const timeFactor = Math.max(0.2, room.timeLeft / ROUND_SECONDS); // 0.2..1
+          const gained = Math.round(BASE_GUESS_POINTS * timeFactor);
+
+          player.score += gained;
+
+          const drawer = room.players.get(room.drawerId);
+          if (drawer) drawer.score += DRAWER_POINTS_PER_GUESS;
+
+          io.to(room.id).emit('chat:msg', {
+            type: 'system',
+            name: 'מערכת',
+            text: `${player.name} ניחש/ה נכון (+${gained})`,
+            ts: Date.now()
+          });
+
+          emitRoom(room);
+          return; // do not show the exact guess text to avoid spoilers
         }
       }
     }
+
+    // Normal chat
+    io.to(room.id).emit('chat:msg', {
+      type: 'chat',
+      name: player.name,
+      text: msg,
+      ts: Date.now()
+    });
   });
 
-  // Extend time (anyone, but costs points)
-  socket.on('time:extend', () => {
-    if (state.phase !== 'drawing') return;
+  socket.on('time:buy', () => {
+    const rid = socket.data.roomId;
+    if (!rid) return;
+    const room = rooms.get(rid);
+    if (!room) return;
 
-    const p = state.players[socket.id];
-    if (!p || !p.isConnected) return;
+    if (room.phase !== 'draw') return;
 
-    // allow only drawer or host? כרגע: כל שחקן יכול לקנות זמן
-    if (p.score < EXTEND_COST_POINTS) {
-      socket.emit('toast', { type: 'error', text: 'אין מספיק נקודות להארכת זמן' });
+    const player = room.players.get(socket.id);
+    if (!player) return;
+
+    if (room.extraPurchases >= MAX_EXTRA_PURCHASES_PER_ROUND) {
+      socket.emit('error:msg', { text: 'כבר הוספתם מקסימום זמן בסבב הזה.' });
       return;
     }
 
-    p.score -= EXTEND_COST_POINTS;
-
-    // extend draw end
-    if (state.drawEndsAt) {
-      state.drawEndsAt += EXTEND_SECONDS * 1000;
+    if (player.score < EXTRA_TIME_COST_POINTS) {
+      socket.emit('error:msg', { text: 'אין לך מספיק נקודות כדי להוסיף זמן.' });
+      return;
     }
 
-    io.emit('toast', { type: 'info', text: `הוספנו ${EXTEND_SECONDS} שניות (עלות ${EXTEND_COST_POINTS})` });
-    broadcastState();
+    // allow only drawer to buy time (simple and controlled)
+    if (socket.id !== room.drawerId) {
+      socket.emit('error:msg', { text: 'רק המצייר/ת יכול/ה להוסיף זמן.' });
+      return;
+    }
+
+    player.score -= EXTRA_TIME_COST_POINTS;
+    room.timeLeft += EXTRA_SECONDS_PER_PURCHASE;
+    room.extraPurchases += 1;
+
+    systemMessage(room, `הוספו ${EXTRA_SECONDS_PER_PURCHASE} שניות (עלות: ${EXTRA_TIME_COST_POINTS} נקודות).`);
+    emitRoom(room);
   });
 
-  // Disconnect
-  socket.on('disconnect', () => {
-    const p = state.players[socket.id];
-    if (p) {
-      p.isConnected = false;
-      io.emit('chat:system', { text: `${p.name} יצא` });
-    }
+  socket.on('game:restart', () => {
+    const rid = socket.data.roomId;
+    if (!rid) return;
+    const room = rooms.get(rid);
+    if (!room) return;
 
-    ensureOrder();
+    // only host
+    if (socket.id !== room.hostId) return;
 
-    // If drawer disconnected mid-turn, end turn quickly
-    if ((state.phase === 'choosing' || state.phase === 'drawing') && socket.id === state.drawerId) {
-      if (state.phase === 'choosing') {
-        // auto-pick and move on
-        setChosenWord(state.wordOptions[0] || pickNWords(1)[0]);
-      } else {
-        endTurn('המצייר יצא');
-      }
-    } else {
-      broadcastState();
-    }
+    // reset
+    clearTimers(room);
+    room.phase = 'lobby';
+    room.drawerId = null;
+    room.round = 0;
+    room.word = null;
+    room.wordMasked = '';
+    room.wordOptions = [];
+    room.guessed = new Set();
+    room.timeLeft = 0;
+    room.extraPurchases = 0;
+
+    // scores reset
+    for (const p of room.players.values()) p.score = 0;
+
+    io.to(room.id).emit('draw:clear');
+    systemMessage(room, 'המשחק אופס.');
+    emitRoom(room);
+
+    tryStartIfAuto(room);
   });
-
-  // First state push (in case client wants it before join)
-  socket.emit('state:update', publicState());
 });
 
-// -----------------------
-// Start
-// -----------------------
-const PORT = process.env.PORT || 3000;
+function leaveRoom(socket, disconnected = false) {
+  const rid = socket.data.roomId;
+  if (!rid) return;
+  const room = rooms.get(rid);
+  if (!room) return;
+
+  const player = room.players.get(socket.id);
+  if (!player) return;
+
+  room.players.delete(socket.id);
+
+  if (!disconnected) socket.leave(rid);
+
+  systemMessage(room, `${player.name} יצא/ה מהחדר.`);
+
+  // host reassignment
+  if (room.hostId === socket.id) {
+    const next = room.players.keys().next().value || null;
+    room.hostId = next;
+    if (next) systemMessage(room, `${getPlayerName(room, next)} הוא/היא המארח/ת עכשיו.`);
+  }
+
+  // drawer left
+  if (room.drawerId === socket.id) {
+    if (room.phase === 'choose' || room.phase === 'draw') {
+      systemMessage(room, 'המצייר/ת יצא/ה. עוברים למצייר/ת הבא/ה.');
+      startChoosePhase(room);
+      return;
+    }
+  }
+
+  // if room empty, delete
+  if (room.players.size === 0) {
+    clearTimers(room);
+    rooms.delete(rid);
+    return;
+  }
+
+  // if not enough players, go lobby
+  if (room.players.size < 2 && room.phase !== 'lobby') {
+    clearTimers(room);
+    room.phase = 'lobby';
+    room.drawerId = null;
+    room.word = null;
+    room.wordMasked = '';
+    room.wordOptions = [];
+    room.timeLeft = 0;
+    room.extraPurchases = 0;
+    io.to(room.id).emit('draw:clear');
+    systemMessage(room, 'אין מספיק שחקנים, חזרנו ללובי.');
+  }
+
+  emitRoom(room);
+}
+
 server.listen(PORT, () => {
-  console.log(`Doodlit server listening on ${PORT}`);
+  console.log(`Doodlit listening on :${PORT}`);
 });
