@@ -1,676 +1,440 @@
-const socket = io({
-    autoConnect: false
-});
+'use strict';
 
-brushsize = 1;
-let canSendCords = true;
-let sendTick = 0, recieveTick = 0;
-let playerCount = 0;
-var chatString = "";
-let chatArea = document.getElementById("chat-container");
-let chatText = document.getElementById('chatField');
-let chatForm = document.getElementById('chat-form');
-let wordCounter = document.getElementById('wordcounter');
-let chatSendBtn = document.getElementById('sendMsgBtn');
-let guessField = document.getElementById('guessWordField')
+const socket = io();
 
-let coord = { x: 0, y: 0, brushsize: brushsize };
-let paint = false;
-const canvas = document.querySelector('#canvas');
-const ctx = canvas.getContext('2d');
-var pName = "";
-var isHost = false;
-var hasGameStarted = false;
-var canDraw = false;
-var canChooseWord = true;
-var guessWord = "";
-var guessedPlayer = false;
-var atleastOneGuessed = false;
-var audioMute = false;
+const $ = (id) => document.getElementById(id);
 
-var penColor = "#000000";
+const joinModal = $('joinModal');
+const chooseModal = $('chooseModal');
+const chooseButtons = $('chooseButtons');
 
+const inpName = $('inpName');
+const inpRoom = $('inpRoom');
+const btnJoin = $('btnJoin');
+const joinErr = $('joinErr');
 
-loginDiv = `
-<div id="overlay" onclick=""></div>
-<div class="loginArea">
-    <h1>Skribbl✍️</h1>
-    <hr>
-    <br>
-    
-    <form id="loginForm">
-        <input id="playerName" type="text" maxlength="20" placeholder="nickname" autocomplete="off"
-            autofocus>
-        <input  id="loginButton" type="button" onclick="loginToGame()" value="DRAW!">
-    </form>
-    <button  id="randomName" onclick="randomNameGen()">🎲</button>
-</div>
-`;
+const btnShare = $('btnShare');
+const btnRestart = $('btnRestart');
 
-hostDiv = `<div id="overlay" onclick=""></div>
-<div class="loginArea" style="width: 350px; height: 230px;">
-  <br>
-  <h1>You are the host...</h1>
-  <h1>Press start to begin</h1>
-  <hr>
-  <br>
-  <button id="startGame" onClick="startGame()" style="padding: 5px; width: 100px; height: 30px;">
-    Let's Draw!
-  </button>
-</div>`;
+const hudRound = $('hudRound');
+const hudTime = $('hudTime');
+const hudWord = $('hudWord');
+const hudDrawer = $('hudDrawer');
 
-waitingDiv = `  
-<div id="overlay" onclick=""></div>
-<div style="height: 215px;" class="loginArea">
-  <br>
-  <h1>Waiting for the host...</h1>
-  <img width="50px"  src="/images/loadingGif.gif">
-  
-</div>`;
+const btnClear = $('btnClear');
+const btnBuyTime = $('btnBuyTime');
 
-choosingWord = ``;
+const playersList = $('playersList');
+const chatLog = $('chatLog');
+const chatForm = $('chatForm');
+const chatInput = $('chatInput');
 
-votingDiv = ` <button onclick="voteUp();document.querySelector('.voting').innerHTML='';"><img id="thumbsUp" src="images/thumbsUp.gif"></button>
-<button onclick="voteDown();document.querySelector('.voting').innerHTML='';"><img id="thumbsDown" src="images/thumbsDown.gif"></button>`;
+const toast = $('toast');
 
+const canvas = $('canvas');
+const ctx = canvas.getContext('2d', { alpha: false });
 
-window.addEventListener('load', () => {
+let me = { id: null, roomId: null, name: null };
+let state = null;
 
-    let playerName = document.getElementById('playerName');
+let isDrawer = false;
+let drawing = false;
+let lastPt = null;
 
-    canvas.addEventListener('mousedown', startPainting);
-    canvas.addEventListener('mouseup', stopPainting);
-    document.addEventListener('mousemove', sketch);
-    canvas.addEventListener('wheel', brushSize);
-    canvas.addEventListener('onmouseout', stopPainting);
-});
-
-let loginContainer = document.getElementById('login-container');
-loginContainer.innerHTML = String(loginDiv);
-
-function getPosition(event) { //Getting the mouse position
-    if (canDraw) {
-        coord.x = event.clientX - canvas.offsetLeft;
-        coord.y = event.clientY - canvas.offsetTop;
-        if ((coord.x < 0 || coord.y < 0) || (coord.x > 800 || coord.y > 600)) {
-            stopPainting();
-        }
-        else if (canSendCords) {
-            sendPosition(coord.x, coord.y); // @Networking
-            return;
-        }
-    }
+function showToast(text, ms = 2200) {
+  toast.textContent = text;
+  toast.classList.remove('hidden');
+  clearTimeout(showToast._t);
+  showToast._t = setTimeout(() => toast.classList.add('hidden'), ms);
 }
 
-class sound {
-    constructor(src) {
-        this.sound = document.createElement("audio");
-        this.sound.src = src;
-        this.sound.setAttribute("preload", "auto");
-        this.sound.setAttribute("controls", "none");
-        this.sound.style.display = "none";
-        document.body.appendChild(this.sound);
-        this.play = function () {
-            if (!audioMute) {
-                console.log("Playing sound!");
-                this.sound.play();
-            }
-        };
-    }
+function safeRoomFromUrl() {
+  // room via hash: #family1 or query ?room=family1
+  const hash = (location.hash || '').replace('#', '').trim();
+  const q = new URLSearchParams(location.search);
+  const qroom = (q.get('room') || '').trim();
+  const rid = (hash || qroom || '').toLowerCase();
+  return rid || '';
 }
 
-function audioToggle(){
-    audioMute = !audioMute;
-    if(audioMute){
-        document.getElementById('audioControl').src = "images/audioOff.gif"
-    }else{
-        document.getElementById('audioControl').src = "images/audioOn.gif"
-
-    }
+function setRoomToUrl(roomId) {
+  const rid = String(roomId || '').trim();
+  if (!rid) return;
+  if (location.hash.replace('#', '') !== rid) {
+    location.hash = rid;
+  }
 }
 
-function startPainting(event) { //Setting the canvas to drawable or not
-    paint = true;
-    getPosition(event);
-    socket.emit('startPaint', paint);
-}
-function stopPainting() { //Setting the canvas to drawable or not
-    paint = false;
-    socket.emit('startPaint', paint);
-    sendTick = 0;
+function openJoinModal(prefRoom) {
+  joinModal.classList.remove('hidden');
+  chooseModal.classList.add('hidden');
+
+  const r = prefRoom || safeRoomFromUrl();
+  if (r) inpRoom.value = r;
+  if (!inpName.value) inpName.focus();
 }
 
-function brushSize(event) {
-    if (event.deltaY < 0 && brushsize < 10) {
-        brushsize += 1;
-    } else if (brushsize > 1) {
-        brushsize -= 1;
-    }
+function closeJoinModal() {
+  joinModal.classList.add('hidden');
 }
 
-function setColor(hexValue) {
-    if (canDraw) {
-        socket.emit('penColor', hexValue);
-    }
+function openChoose(options) {
+  chooseButtons.innerHTML = '';
+  for (const w of options) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'chooseBtn';
+    b.textContent = w;
+    b.addEventListener('click', () => {
+      socket.emit('word:choose', { word: w });
+      chooseModal.classList.add('hidden');
+    });
+    chooseButtons.appendChild(b);
+  }
+  chooseModal.classList.remove('hidden');
 }
 
-socket.on('startPaint', paintStatus => {
-    paint = paintStatus;
-    if (!paint) {
-        recieveTick = 0;
-    }
-})
-
-
-function sketch(event) {
-    if (!paint) return;
-    if (canDraw) {
-        ctx.beginPath();
-        ctx.lineWidth = brushsize;
-        ctx.lineCap = 'round';
-        console.log(penColor);
-        ctx.strokeStyle = penColor;
-        ctx.moveTo(coord.x, coord.y);
-        getPosition(event);
-        ctx.lineTo(coord.x, coord.y);
-        ctx.stroke();
-    }
+function closeChoose() {
+  chooseModal.classList.add('hidden');
 }
 
-window.onbeforeunload = function (event) {
-    //return confirm("Confirm refresh");
-};
+function appendChat({ type, name, text }) {
+  const wrap = document.createElement('div');
+  wrap.className = 'chatMsg' + (type === 'system' ? ' system' : '');
+  const who = document.createElement('div');
+  who.className = 'who';
+  who.textContent = name;
+  const txt = document.createElement('div');
+  txt.className = 'txt';
+  txt.textContent = text;
 
-
-
-chatForm.addEventListener('submit', event => {
-    chatString = "";
-    wordcounter.innerHTML = `(${chatString.length})`;
-    chatText.value = ""
-    chatText.focus();
-    event.preventDefault();
-});
-
-
-
-document.getElementById('loginForm').addEventListener('submit', event => {
-    event.preventDefault();
-    loginToGame();
-
-});
-
-chatText.addEventListener('input', event => {
-    chatString = chatText.value;
-    wordcounter.innerHTML = `(${chatString.length})`;
-
-    if (chatString.length == 0)
-        wordcounter.innerHTML = "";
-
-});
-
-function enableChat() {
-    chatSendBtn.disabled = false;
-    chatText.disabled = false;
+  wrap.appendChild(who);
+  wrap.appendChild(txt);
+  chatLog.appendChild(wrap);
+  chatLog.scrollTop = chatLog.scrollHeight;
 }
 
-function updateSendChat() {
-    chatText.focus();
-    if (chatString.length > 0 && canDraw == false || chatString.includes("//admin")) {
-        var msg = `<div class="chat-message"><b>${pName}: </b><pre><code><xmp>${chatText.value}</xmp></pre></code> </div>`;
-        sendMsg = ([pName, chatText.value]);
-        socket.emit('updateText', sendMsg);//JSON.stringify(sendMsg)
-        //chatArea.innerHTML = msg + chatArea.innerHTML;
+function renderPlayers(players) {
+  playersList.innerHTML = '';
+  players.forEach((p, idx) => {
+    const row = document.createElement('div');
+    row.className = 'playerRow';
 
-        chatString = "";
-        wordcounter.innerHTML = `(${chatString.length})`;
-        chatText.value = ""
-    }
+    const left = document.createElement('div');
+    left.className = 'playerLeft';
+
+    const badge = document.createElement('div');
+    badge.className = 'badge';
+    badge.textContent = String(idx + 1);
+
+    const info = document.createElement('div');
+    info.style.minWidth = '0';
+
+    const name = document.createElement('div');
+    name.className = 'playerName';
+    name.textContent = p.name;
+
+    const meta = document.createElement('div');
+    meta.className = 'playerMeta';
+    const tags = [];
+    if (p.isHost) tags.push('מארח');
+    if (p.isDrawer) tags.push('מצייר/ת');
+    meta.textContent = tags.length ? tags.join(' | ') : 'שחקן';
+
+    info.appendChild(name);
+    info.appendChild(meta);
+
+    left.appendChild(badge);
+    left.appendChild(info);
+
+    const score = document.createElement('div');
+    score.className = 'playerScore';
+    score.textContent = String(p.score);
+
+    row.appendChild(left);
+    row.appendChild(score);
+    playersList.appendChild(row);
+  });
 }
 
-function addContentToChat(chatPlayerName = "Server", chatContent, color = "black", bgColor = "white") {
+function updateHud() {
+  if (!state) return;
 
-    if (chatPlayerName == "Server") {
-        if (color == "red") {
-            var msg = `<div class="chat-message" style=" color:${color};background-color:rgb(252, 153, 153);"><b>${chatPlayerName}: </b><pre><code><xmp>${chatContent}</xmp></pre></code> </div>`;
+  hudRound.textContent = String(state.round || 0);
+  hudTime.textContent = String(state.timeLeft ?? 0);
 
-        } else {
-            var msg = `<div class="chat-message" style=" color:${color};background-color:light${bgColor};"><b>${chatPlayerName}: </b><pre><code><xmp>${chatContent}</xmp></pre></code> </div>`;
-        }
-    } else {
-        var msg = `<div class="chat-message"><b>${chatPlayerName}: </b><pre><code><xmp>${chatContent}</xmp></pre></code> </div>`;
-    }
-    chatArea.innerHTML = msg + chatArea.innerHTML;
+  const drawer = state.players.find(p => p.id === state.drawerId);
+  if (state.phase === 'lobby') {
+    hudDrawer.textContent = 'ממתין לשחקנים...';
+    hudWord.textContent = '-';
+  } else if (state.phase === 'choose') {
+    hudDrawer.textContent = drawer ? `מצייר/ת: ${drawer.name} | בחירת מילה...` : 'בחירת מילה...';
+    hudWord.textContent = '-';
+  } else if (state.phase === 'draw') {
+    hudDrawer.textContent = drawer ? `מצייר/ת: ${drawer.name}` : 'מצייר/ת: -';
+    // hudWord updated by word:set
+  } else if (state.phase === 'reveal') {
+    hudDrawer.textContent = 'מגלים את המילה...';
+  }
+
+  btnRestart.disabled = !(me.id && state.hostId === me.id);
+  btnClear.disabled = !(isDrawer && state.phase === 'draw');
+  btnBuyTime.disabled = !(isDrawer && state.phase === 'draw');
+
+  // Update buy time label with costs
+  const ex = state.extra;
+  if (ex) {
+    btnBuyTime.textContent = `הוסף זמן (+${ex.addSeconds})`;
+  }
 }
 
+function resizeCanvas() {
+  const rect = canvas.getBoundingClientRect();
+  const dpr = Math.max(1, window.devicePixelRatio || 1);
 
-function voteUp() {
-    socket.emit('vote', [pName, "up"]);
-}
-function voteDown() {
-    socket.emit('vote', [pName, "down"]);
-}
+  const w = Math.max(1, Math.floor(rect.width * dpr));
+  const h = Math.max(1, Math.floor(rect.height * dpr));
 
-socket.on('vote', voteStatus => {
-    if (voteStatus[1] == "up") {
-        addContentToChat(undefined, `${voteStatus[0]} liked the drawing.`, "green", "green");
-    }
-    if (voteStatus[1] == "down") {
-        addContentToChat(undefined, `${voteStatus[0]} disliked the drawing.`, "red");
-    }
-});
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w;
+    canvas.height = h;
 
-score = 0;
-class PlayerContainer {
-    constructor(containerId) {
-        this.container = document.getElementById(containerId);
-        this.players = [];
-    }
+    ctx.fillStyle = '#0a0d14';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-    addPlayer(playerId, playerScore) {
-        score = playerScore;
-        const player = document.createElement('div');
-        player.classList.add('player');
-        player.setAttribute('data-id', playerId);
-        player.setAttribute('data-score', playerScore);
-        player.innerHTML = `<div class="player-div"><div class="player-name"></b><pre><code><xmp>${player.getAttribute('data-id')}</xmp></pre></code></div>  <div class="player-score">${player.getAttribute('data-score')}</div> </div>`;
-        this.players.push(player);
-        this.container.appendChild(player);
-        this.sortPlayersByScore();
-    }
-
-    removePlayer(playerId) {
-        const index = this.players.findIndex(player => player.getAttribute('data-id') === playerId);
-        if (index >= 0) {
-            this.players.splice(index, 1);
-            const player = this.container.querySelector(`[data-id="${playerId}"]`);
-            this.container.removeChild(player);
-        }
-    }
-
-    rearrangePlayers() {
-        this.players.forEach((player, index) => {
-            player.style.order = index;
-        });
-    }
-
-    highlightPlayer(playerName) {
-        const playerDiv = this.container.querySelector(`.player[data-id="${playerName}"]`);
-
-        if (playerDiv) {
-            playerDiv.querySelector(".player-div").classList.add('drawingPlayer');
-        }
-    }
-
-    unhighlightPlayer(playerName) {
-        const playerDiv = this.container.querySelector(`.player[data-id="${playerName}"]`);
-
-        if (playerDiv) {
-            playerDiv.querySelector(".player-div").classList.remove('drawingPlayer');
-        }
-    }
-
-    sortPlayersByScore() {
-        this.players.sort((a, b) => b.getAttribute('data-score') - a.getAttribute('data-score'));
-        this.rearrangePlayers();
-        this.addCrownToFirst();
-    }
-
-    addCrownToFirst() {
-        if (this.players[0].getAttribute('data-score') > 0) {
-            this.players[0].innerHTML = `<div class="player-div"> <img width="30px" height="30px"  src="images/crown.png"> <div class="player-name">${this.players[0].getAttribute('data-id')}</div>  <div class="player-score">${this.players[0].getAttribute('data-score')}</div> </div>`;
-        }
-        for (let index = 1; index < this.players.length; index++) {
-            const element = this.players[index];
-            if (element.getAttribute('data-score') > 0) {
-                element.innerHTML = `<div class="player-div"><div class="player-name"></b><pre><code><xmp>${element.getAttribute('data-id')}</xmp></pre></code></div>  <div class="player-score">${element.getAttribute('data-score')}</div> </div>`;
-            }
-        }
-    }
-
-    markWinnerCelebrate() {
-        this.players[0].classList.add('winner');
-
-    }
-
-    markCorrectGuess(playerName) {
-        const playerDiv = this.container.querySelector(`.player[data-id="${playerName}"]`);
-
-        if (playerDiv) {
-            playerDiv.querySelector(".player-div").classList.add('correctGuessPlayer');
-        }
-    }
-
-    resetCorrectGuess() {
-        var p = this.getPlayers();
-        p.forEach(element => {
-            const playerDiv = this.container.querySelector(`.player[data-id="${element}"]`);
-
-            if (playerDiv) {
-                playerDiv.querySelector(".player-div").classList.remove('correctGuessPlayer');
-            }
-        });
-    }
-
-    getPlayers() {
-        return this.players.map(playerDiv => playerDiv.getAttribute('data-id'));
-    }
-
-    updatePlayerScore(player_id, newScore) {
-        this.players.forEach(p => {
-            if (p.getAttribute('data-id') == player_id) {
-                p.setAttribute('data-score', newScore);
-            }
-        });
-        this.sortPlayersByScore();
-    }
-}
-const playerContainer = new PlayerContainer('player-container');
-
-function startGame() {
-    socket.emit('startGame');
-    loginContainer.innerHTML = "";
-}
-
-
-
-// ######## NETWORKING ########
-//------------------------------------------------------------------------------------
-
-function sendPosition(Xpos, Ypos) {
-    if (canDraw) {
-        socket.emit('position', { x: Xpos, y: Ypos, brushsize: brushsize });
-        sendTick++;
-    }
-
-}
-
-socket.on('welcom', msg => {
-    console.log(msg);
-});
-
-var pName = "";
-
-function loginToGame() {
-    pName = playerName.value;
-    document.title = `Skribbl->${pName}`;
-    if (pName.length > 0 && pName !== "" && pName != " ") {
-        enableChat();
-        pName = pName.trim();
-        socket.connect();
-        playerContainer.addPlayer(pName, 0);
-        socket.emit('playerName', pName)
-        loginContainer.style.height = "200px";
-        loginContainer.innerHTML = waitingDiv;
-        chatText.focus();
-    } else {
-        console.log("INVALID LOGIN!");
-    }
-}
-
-function randomNameGen() {
-    var nameList = ["Buddy", "King", "Champ", "Bro", "Amigo", "Tiny", "Chief", "Pal", "Bee", "Boo", "Bug", "Scout", "Boomer", "Punk", "Ace"];
-    var randomName = nameList[Math.floor(Math.random() * nameList.length)];
-    playerName.value = randomName;
-}
-
-
-socket.on('newPlayerJoined', newPlayerName => {
-    var joinSound = new sound("/sfx/joinGame.mp3");
-    joinSound.play();
-    console.log(newPlayerName, " joined 👋🏻");
-    addContentToChat(undefined, newPlayerName + " joined 👋🏻", "green");
-    playerContainer.addPlayer(newPlayerName, 0);
-});
-
-socket.on('playersList', playersList => {
-    pList = JSON.parse(playersList);
-    for (const player in pList) {
-        if (player != pName) {
-            playerContainer.addPlayer(player, pList[player]);
-        }
-    }
-});
-
-socket.on('hostPlayer', boolVal => {
-    isHost = boolVal;
-    if (isHost) {
-        loginContainer.style.height = "230px";
-        loginContainer.style.width = "550px";
-        loginContainer.innerHTML = hostDiv;
-    }
-});
-
-socket.on('wordCount', guessWordCount => {
-    if (!canDraw) {
-        var dashStr = "";
-        guessField.innerText = "Word: ";
-        dashStr = "(" + String(guessWordCount) + "): ";
-        for (let count = 0; count < guessWordCount; count++) {
-            dashStr += "_ ";
-        }
-        guessField.innerText += dashStr;
-    }
-});
-
-socket.on('allGuessed', () => {
-    var allGuessed = new sound("/sfx/allGuess.mp3");
-    allGuessed.play();
-});
-
-socket.on('chatContent', content => {
-    //content = [who, what]
-
-    if (content[0] == "kick") {
-        addContentToChat(undefined, `${content[1]} is kicked 🦵🏻`, "red");
-    } else {
-        if (content[1] == "almost" && !guessedPlayer) {
-            addContentToChat(undefined, ` ${content[0]}'s guess is close `, "orange");
-        } else {
-            if (guessedPlayer && content[1].includes(guessWord)) {
-                var censorWord = "";
-                for (i = 0; i < content[1].length; i++) {
-                    censorWord += "*";
-                }
-                addContentToChat(content[0], censorWord);
-            } else {
-                addContentToChat(content[0], content[1]);
-            }
-        }
-    }
-
-
-});
-
-socket.on('otherPOS', position => {
-    recieveTick++;
-    paint = true;
-    ctx.beginPath();
-
-    ctx.lineWidth = position.brushsize;
     ctx.lineCap = 'round';
-    ctx.strokeStyle = penColor;
-    if (recieveTick == 1) {
-        ctx.moveTo(position.x, position.y);
+    ctx.lineJoin = 'round';
+    ctx.lineWidth = Math.max(2, Math.floor(4 * dpr));
+    ctx.strokeStyle = '#ffffff';
+  }
+}
+
+window.addEventListener('resize', () => {
+  resizeCanvas();
+});
+
+function toCanvasPoint(clientX, clientY) {
+  const rect = canvas.getBoundingClientRect();
+  const dpr = Math.max(1, window.devicePixelRatio || 1);
+  const x = (clientX - rect.left) * dpr;
+  const y = (clientY - rect.top) * dpr;
+  return { x, y };
+}
+
+function drawLine(a, b) {
+  ctx.beginPath();
+  ctx.moveTo(a.x, a.y);
+  ctx.lineTo(b.x, b.y);
+  ctx.stroke();
+}
+
+function clearBoardLocal() {
+  ctx.fillStyle = '#0a0d14';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+}
+
+function setDrawingEnabled(enabled) {
+  isDrawer = enabled;
+  btnClear.disabled = !(enabled && state && state.phase === 'draw');
+  btnBuyTime.disabled = !(enabled && state && state.phase === 'draw');
+}
+
+function preventScrollWhileDrawing(e) {
+  // Critical for iOS/Safari
+  if (isDrawer && state && state.phase === 'draw') {
+    e.preventDefault();
+  }
+}
+
+canvas.addEventListener('touchstart', preventScrollWhileDrawing, { passive: false });
+canvas.addEventListener('touchmove', preventScrollWhileDrawing, { passive: false });
+
+function onPointerDown(e) {
+  if (!isDrawer || !state || state.phase !== 'draw') return;
+
+  drawing = true;
+  const p = toCanvasPoint(e.clientX, e.clientY);
+  lastPt = p;
+
+  socket.emit('draw:stroke', { t: 'start', p });
+}
+
+function onPointerMove(e) {
+  if (!drawing || !isDrawer || !state || state.phase !== 'draw') return;
+
+  const p = toCanvasPoint(e.clientX, e.clientY);
+  if (lastPt) drawLine(lastPt, p);
+  socket.emit('draw:stroke', { t: 'move', p });
+  lastPt = p;
+}
+
+function onPointerUp() {
+  if (!drawing) return;
+  drawing = false;
+  lastPt = null;
+  if (isDrawer) socket.emit('draw:stroke', { t: 'end' });
+}
+
+canvas.addEventListener('pointerdown', (e) => {
+  canvas.setPointerCapture(e.pointerId);
+  onPointerDown(e);
+});
+
+canvas.addEventListener('pointermove', (e) => {
+  onPointerMove(e);
+});
+
+canvas.addEventListener('pointerup', () => onPointerUp());
+canvas.addEventListener('pointercancel', () => onPointerUp());
+
+// Receive drawing from server (drawer broadcasts)
+socket.on('draw:stroke', (payload) => {
+  if (!payload) return;
+  if (payload.t === 'start') {
+    lastPt = payload.p || null;
+  } else if (payload.t === 'move') {
+    const p = payload.p;
+    if (lastPt && p) drawLine(lastPt, p);
+    lastPt = p;
+  } else if (payload.t === 'end') {
+    lastPt = null;
+  }
+});
+
+socket.on('draw:clear', () => {
+  clearBoardLocal();
+});
+
+btnClear.addEventListener('click', () => {
+  if (!isDrawer) return;
+  socket.emit('draw:clear');
+});
+
+btnBuyTime.addEventListener('click', () => {
+  socket.emit('time:buy');
+});
+
+btnShare.addEventListener('click', async () => {
+  const rid = me.roomId || safeRoomFromUrl();
+  if (!rid) {
+    showToast('אין קוד חדר לשיתוף.');
+    return;
+  }
+  const url = `${location.origin}${location.pathname}#${rid}`;
+  try {
+    if (navigator.share) {
+      await navigator.share({ title: 'Doodlit!', text: 'לינק למשחק Doodlit!', url });
     } else {
-        ctx.moveTo(coord.x, coord.y);
+      await navigator.clipboard.writeText(url);
+      showToast('הלינק הועתק.');
     }
-    ctx.lineTo(position.x, position.y);
-    coord.x = position.x;
-    coord.y = position.y;
-    ctx.stroke();
-    paint = false;
-});
-
-function clearCanvas() {
-    if (canDraw) {
-        socket.emit('clearCanvas');
+  } catch {
+    try {
+      await navigator.clipboard.writeText(url);
+      showToast('הלינק הועתק.');
+    } catch {
+      showToast('לא הצלחתי להעתיק. תעתיק ידנית מהכתובת.');
     }
-}
-
-socket.on('penColor', hexValue => {
-    penColor = hexValue;
-    console.log('PC: ', penColor);
-
+  }
 });
 
-socket.on('clearCanvas', () => {
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
+btnRestart.addEventListener('click', () => {
+  socket.emit('game:restart');
 });
 
-socket.on('gameStarted', () => {
-    console.log("GAME STARTED!!");
-    loginContainer.innerHTML = "";
-    hasGameStarted = true;
-
+chatForm.addEventListener('submit', (e) => {
+  e.preventDefault();
+  const t = chatInput.value.trim();
+  if (!t) return;
+  socket.emit('chat:msg', { text: t });
+  chatInput.value = '';
 });
 
-socket.on('wordList', wordList => {
+// Word flow
+socket.on('word:options', ({ options }) => {
+  if (!Array.isArray(options)) return;
+  openChoose(options);
+});
 
-    if (canDraw) {
-        var wordChooseDiv = `  
-        <div id="overlay" onclick=""></div>
-        <div class="loginArea" style="width: fit-content; height: fit-content;">
-        <h1>Choose a word</h1>
-        <button class="optBtn" id="opt1" onclick="selectedOpt('${wordList[0]}')">${wordList[0]}</button>
-        <button class="optBtn" id="opt2" onclick="selectedOpt('${wordList[1]}')">${wordList[1]}</button>
-        <button class="optBtn" id="opt3" onclick="selectedOpt('${wordList[2]}')">${wordList[2]}</button>
-        </div>`;
-        loginContainer.innerHTML = wordChooseDiv;
-        console.log("YOU DRAW")
+socket.on('word:set', ({ word, masked, isDrawer: drawerFlag }) => {
+  setDrawingEnabled(!!drawerFlag);
+
+  if (drawerFlag && word) {
+    hudWord.textContent = word; // drawer sees full
+  } else {
+    hudWord.textContent = masked || '';
+  }
+
+  if (!drawerFlag) closeChoose();
+});
+
+socket.on('word:reveal', ({ word }) => {
+  if (word) hudWord.textContent = word;
+  closeChoose();
+});
+
+// Room state
+socket.on('room:state', (s) => {
+  state = s;
+  me.id = socket.id;
+
+  // determine if drawer
+  isDrawer = !!(state && state.drawerId === me.id);
+  renderPlayers(state.players || []);
+  updateHud();
+});
+
+socket.on('chat:msg', (m) => {
+  appendChat(m);
+});
+
+socket.on('error:msg', ({ text }) => {
+  showToast(text || 'שגיאה');
+});
+
+// Join
+btnJoin.addEventListener('click', () => {
+  joinErr.classList.add('hidden');
+  const name = inpName.value.trim();
+  const roomId = inpRoom.value.trim().toLowerCase();
+
+  if (!name) {
+    joinErr.textContent = 'צריך למלא שם.';
+    joinErr.classList.remove('hidden');
+    return;
+  }
+  if (!roomId) {
+    joinErr.textContent = 'צריך למלא קוד חדר.';
+    joinErr.classList.remove('hidden');
+    return;
+  }
+
+  me.name = name;
+  me.roomId = roomId;
+  setRoomToUrl(roomId);
+
+  socket.emit('room:join', { roomId, name });
+  closeJoinModal();
+
+  showToast('התחברת לחדר.');
+});
+
+// Initial setup
+(function init() {
+  // prevent double-tap zoom behaviors on iOS in some cases
+  let lastTouchEnd = 0;
+  document.addEventListener('touchend', function (event) {
+    const now = Date.now();
+    if (now - lastTouchEnd <= 300) {
+      event.preventDefault();
     }
-});
+    lastTouchEnd = now;
+  }, { passive: false });
 
-socket.on('chosenWord', wordAndPlayer => {
-    if (pName == wordAndPlayer[1]) {
-        selectedOpt(wordAndPlayer[0], true);
-    }
-})
+  resizeCanvas();
 
+  const rid = safeRoomFromUrl();
+  if (rid) inpRoom.value = rid;
 
-function selectedOpt(chosenWord, autoSelected = false) {
-    if (!autoSelected) {
-        socket.emit('chosenWord', chosenWord);
-    }
-    loginContainer.innerHTML = "";
-    guessField.innerText = "Word: " + chosenWord;
-}
-
-var timerChooseReset;
-socket.on('chooseStart', chooseTime => {
-    timerChooseReset = timer(chooseTime);
-    canChooseWord = true;
-})
-
-socket.on('chooseEnd', () => {
-    canChooseWord = false;
-    loginContainer.innerHTML = "";
-    clearInterval(timerChooseReset);
-})
-
-var drawTimerReset;
-socket.on('drawStart', drawtime => {
-    var startDrawing = new sound("/sfx/startDrawing.mp3");
-    startDrawing.play();
-    playerContainer.resetCorrectGuess();
-    clearCanvas();
-    drawTimerReset = timer(drawtime);
-})
-
-function timer(timerVal) {
-    var timerText = document.getElementById('timer');
-    timerText.innerText = `[${timerVal}]`;
-    counter = parseInt(timerVal);
-
-    var timerFunc = setInterval(() => {
-        timerText.innerText = `[${counter}]`;
-        counter--;
-        if (counter < 10) {
-            var clockTick = new sound("/sfx/clockTick.mp3");
-            clockTick.play();
-        }
-
-        if (counter < 0) {
-            clearInterval(timerFunc);
-            timerFunc = undefined;
-        }
-    }, 1000);
-    return timerFunc;
-}
-
-socket.on('correctGuess', correctGuessPlayer => {
-    atleastOneGuessed = true;
-    var correctGuessSFX = new sound("/sfx/correctGuess.mp3");
-    correctGuessSFX.play();
-    playerContainer.markCorrectGuess(correctGuessPlayer[0]);
-    addContentToChat(undefined, correctGuessPlayer[0] + " guessed the word.", "green", "green");
-    if (pName == correctGuessPlayer[0]) {
-        guessField.innerText = "Word: " + correctGuessPlayer[1];
-        guessWord = correctGuessPlayer[1];
-        guessedPlayer = true;
-    }
-});
-
-socket.on('playerLeft', leftPlayer => {
-    var leftSound = new sound("/sfx/leaveGame.mp3");
-    leftSound.play();
-    playerContainer.removePlayer(leftPlayer);
-    addContentToChat(undefined, leftPlayer + " left :(", "red")
-});
-
-socket.on('testing', dat => {
-    //console.log("TESTING: ",dat)
-});
-
-socket.on('chosenPlayer', drawingPlayer => {
-    document.querySelector('.voting').innerHTML = votingDiv;
-    guessedPlayer = false;
-    playerContainer.getPlayers().forEach(element => {
-        playerContainer.unhighlightPlayer(element); // Unhighlight all players before highlighting
-    });
-
-    playerContainer.highlightPlayer(drawingPlayer);
-    console.log('Chosen Player to draw: ', drawingPlayer); // Highlight the player who will be drawing
-    addContentToChat(undefined, `${drawingPlayer} is drawing`, "blue");
-    if (drawingPlayer == pName) {
-        document.querySelector('.voting').innerHTML = '';
-        canDraw = true;
-    }
-    else {
-        canDraw = false;
-        loginContainer.innerHTML = `  <div style="width: fit-content; height: fit-content; padding-left: 30px; padding-right: 30px; background-color: white;" class="loginArea">
-        <br>
-        <h1>${drawingPlayer} is choosing a word</h1>
-    
-      </div>`;
-
-    }
-});
-
-
-socket.on('drawEnd', () => {
-    clearInterval(drawTimerReset);
-    canDraw = false;
-    clearCanvas();
-    if (!atleastOneGuessed) {
-        var noGuess = new sound("/sfx/noGuess.mp3");
-        noGuess.play();
-    }
-})
-
-socket.on('scoreBoard', scoreBoard => {
-    scoreBoard.forEach(ele => {
-        playerContainer.updatePlayerScore(ele[0], ele[1]);
-    });
-});
-
-socket.on('gameOver', () => {
-    console.log("GO!");
-    playerContainer.markWinnerCelebrate();
-});
-
-socket.on("disconnect", () => {
-    socket.disconnect();
-    loginContainer.innerHTML = loginDiv;
-    location.reload();
-});
-
+  openJoinModal(rid);
+})();
