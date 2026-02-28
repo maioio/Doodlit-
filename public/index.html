@@ -1,89 +1,124 @@
-<!DOCTYPE html>
-<html lang="en">
-
+<!doctype html>
+<html lang="he" dir="rtl">
 <head>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <link rel="stylesheet" href="styles.css">
-    <script src="/socket.io/socket.io.js"></script>
-    <title>Skribbl</title>
-
-
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no" />
+  <meta name="theme-color" content="#0b0f19" />
+  <title>Doodlit!</title>
+  <link rel="icon" href="favicon.ico" />
+  <link rel="stylesheet" href="styles.css" />
 </head>
 
-
 <body>
-    <div class="overallHolder">
+  <div id="app">
+    <header class="topbar">
+      <div class="brand">
+        <div class="logoWrap">
+          <!-- אם תוסיף קובץ public/logo.png זה יוצג אוטומטית -->
+          <img id="brandLogo" src="logo.png" alt="Doodlit" onerror="this.style.display='none'">
+        </div>
+        <div class="brandText">
+          <div class="brandName">Doodlit!</div>
+          <div class="brandSub">משחק ציור וניחושים</div>
+        </div>
+      </div>
 
+      <div class="topActions">
+        <button id="btnShare" class="btn ghost" type="button">שיתוף לינק</button>
+        <button id="btnRestart" class="btn danger" type="button" title="איפוס משחק (מארח בלבד)">איפוס</button>
+      </div>
+    </header>
 
-        <div id="player-container"></div>
+    <main class="layout">
+      <!-- LEFT: canvas + round info -->
+      <section class="board">
+        <div class="hud">
+          <div class="hudRow">
+            <div class="pill">
+              <span class="label">סבב</span>
+              <span id="hudRound" class="value">0</span>
+            </div>
 
+            <div class="pill">
+              <span class="label">זמן</span>
+              <span id="hudTime" class="value">0</span>
+            </div>
 
-        <div id="chat-container" class="chat-container"></div>
-        <div class="chatInput">
-            <form id="chat-form" onsubmit="updateSendChat()">
-                <input id="chatField" disabled type="text" placeholder="Guess" maxlength="50" autocomplete="off">
-                <button id="sendMsgBtn" disabled type="button" onclick="updateSendChat()">Send</button>
-                <p id="wordcounter"></p>
+            <div class="pill wordPill">
+              <span class="label">מילה</span>
+              <span id="hudWord" class="value">-</span>
+            </div>
+          </div>
 
-            </form>
+          <div class="hudRow">
+            <div class="drawerInfo" id="hudDrawer">ממתין...</div>
+
+            <div class="hudButtons">
+              <button id="btnClear" class="btn" type="button" disabled>נקה</button>
+              <button id="btnBuyTime" class="btn" type="button" disabled>הוסף זמן</button>
+            </div>
+          </div>
         </div>
 
-
-        <div>
+        <div class="canvasWrap">
+          <canvas id="canvas"></canvas>
         </div>
 
-        <div id="topBar">
-            <p id="guessWordField">WORD: </p>
-            <img id="timerIcon" width="45px" height="45px" src="/images/timer.png">
-            <p id="timer"> 0 </p>
+        <!-- Choose word modal -->
+        <div id="chooseModal" class="modal hidden" role="dialog" aria-modal="true">
+          <div class="modalCard">
+            <div class="modalTitle">בחר/י מילה</div>
+            <div class="modalSub">יש לך זמן קצר לבחור. אם לא, נבחר אוטומטית.</div>
+            <div id="chooseButtons" class="chooseButtons"></div>
+          </div>
         </div>
 
-        <div id="bottomBar">
-            <button style="background-color: #FF0000; border-radius: 10px; " value="#FF0000"
-                onclick="setColor('#FF0000')"></button>
-            <button style="background-color: #4ae000;border-radius: 10px;" value="#4ae000"
-                onclick="setColor('#4ae000')"></button>
-            <button style="background-color: #0041c4;border-radius: 10px;" value="#0041c4"
-                onclick="setColor('#0041c4')"></button>
-            <button style="background-color: #fbd420;border-radius: 10px;" value="#fbd420"
-                onclick="setColor('#fbd420')"></button>
-            <button style="background-color: #fb5819;border-radius: 10px;" value="#fb5819"
-                onclick="setColor('#fb5819')"></button>
-            <button style="background-color: #bc19fb;border-radius: 10px;" value="#bc19fb"
-                onclick="setColor('#bc19fb')"></button>
-            <button style="background-color: #904e0c;border-radius: 10px;" value="#904e0c"
-                onclick="setColor('#904e0c')"></button>
-            <button style="background-color: #000000;border-radius: 10px;" value="#000000"
-                onclick="setColor('#000000')"></button>
-            <button style="background-color: #ffff;border-radius: 10px;" value="#ffff "
-                onclick="setColor('#ffff')"></button>
-            <button style="border-radius: 50%;" onclick="clearCanvas()">🗑️</button>
+        <!-- Join modal -->
+        <div id="joinModal" class="modal" role="dialog" aria-modal="true">
+          <div class="modalCard">
+            <div class="modalTitle">כניסה לחדר</div>
+            <div class="modalSub">שתפו לינק למשפחה, וכל מי שיפתח אותו ייכנס לאותו החדר.</div>
 
+            <div class="field">
+              <label class="fieldLabel" for="inpName">שם</label>
+              <input id="inpName" class="fieldInput" inputmode="text" autocomplete="nickname" maxlength="18" placeholder="לדוגמה: מאיו" />
+            </div>
 
+            <div class="field">
+              <label class="fieldLabel" for="inpRoom">קוד חדר</label>
+              <input id="inpRoom" class="fieldInput mono" inputmode="text" maxlength="32" placeholder="לדוגמה: family1" />
+              <div class="hint">אם פתחתם לינק שקיבלתם, זה כבר ימולא.</div>
+            </div>
+
+            <button id="btnJoin" class="btn primary" type="button">כניסה</button>
+            <div id="joinErr" class="err hidden"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- RIGHT: players + chat -->
+      <aside class="side">
+        <div class="card">
+          <div class="cardTitle">שחקנים</div>
+          <div id="playersList" class="players"></div>
         </div>
 
-        <div class="voting">
-            <button onclick="voteUp();document.querySelector('.voting').innerHTML='';"><img id="thumbsUp"
-                    src="images/thumbsUp.gif"></button>
-            <button onclick="voteDown();document.querySelector('.voting').innerHTML='';"><img id="thumbsDown"
-                    src="images/thumbsDown.gif"></button>
+        <div class="card chatCard">
+          <div class="cardTitle">צ׳אט וניחושים</div>
+          <div id="chatLog" class="chatLog"></div>
+
+          <form id="chatForm" class="chatForm" autocomplete="off">
+            <input id="chatInput" class="chatInput" maxlength="140" placeholder="כתוב/י ניחוש או הודעה" />
+            <button class="btn primary" type="submit">שלח</button>
+          </form>
+
+          <div id="toast" class="toast hidden"></div>
         </div>
+      </aside>
+    </main>
+  </div>
 
-    </div>
-    <canvas id="canvas" width="800" height="600"
-    style="background-color: white;border:1px solid #000000; border-radius: 5px;"></canvas>
-
-
-    <button style="position: absolute; z-index: 6; border: 0px;background-color: transparent;"
-        onclick="audioToggle()"><img width="60px" id="audioControl" src="images/audioOn.gif"></button>
-
-    <br>
-
-    <div id="login-container"></div>
-
-    <script src="index.js"></script>
-
-
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="index.js"></script>
 </body>
-
 </html>
